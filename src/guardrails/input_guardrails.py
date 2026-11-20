@@ -137,6 +137,7 @@ def detect_injection(user_input: str) -> InputStatus:
         r"\b(translate|convert|encode|format|summarize|paraphrase|rewrite)\s+(everything\s+above|the\s+above|your\s+(instructions?|prompt|rules?|system\s+message|config))\b",
         r"\b(base64|rot13|hexadecimal|\bhex\b|morse\s+code|caesar\s+cipher|ascii\s+codes?|leetspeak|backwards|in\s+reverse|acrostic|first\s+letter\s+of\s+each)\b",
         r"\b(verbatim|word\s+for\s+word|character\s+by\s+character|letter\s+by\s+letter|spell\s+out)\b",
+        r"\b(instead\s+of|stop\s+being|forget\s+about)\s+(a\s+)?(banking|vinbank|bank\s+assistant)\b",
 
         # --- Nhóm dò secret / Confirmation / Completion (CP4 kỹ thuật #1 & #4) ---
         r"\b(admin[_\s-]?password|api[_\s-]?key|db[_\s-]?host|connection\s+string|internal\s+database|vinbank[_\s-]?secrets|port\s*5432)\b",
@@ -153,6 +154,8 @@ def detect_injection(user_input: str) -> InputStatus:
         r"(bỏ\s+qua|quên\s+hết|phớt\s+lờ|ghi\s+đè)\s+(mọi|tất\s+cả|các)?\s*(hướng\s+dẫn|chỉ\s+thị|quy\s+tắc|lệnh)",
         r"(tiết\s+lộ|cho\s+xem|in\s+ra|dịch|mã\s+hóa)\s+.*(mật\s+khẩu\s+admin|system\s+prompt|api\s*key|db\s*host|bí\s+mật|cấu\s+hình\s+nội\s+bộ|hướng\s+dẫn\s+hệ\s+thống)",
         r"(đóng\s+vai|giả\s+vờ\s+là)\s+.*(không\s+giới\s+hạn|quản\s+trị\s+viên|admin|kiểm\s+toán\s+viên)",
+
+
     ]
 
     for cand in candidates:
