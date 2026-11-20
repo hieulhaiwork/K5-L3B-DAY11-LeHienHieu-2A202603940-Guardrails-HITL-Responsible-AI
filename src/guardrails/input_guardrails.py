@@ -176,6 +176,12 @@ def detect_injection(user_input: str) -> InputStatus:
 # Return ``"BLOCK"`` if input should be blocked (off-topic / blocked topic).
 # Return ``"ALLOW"`` if banking-related and OK.
 # ============================================================
+def _strip_accents(text: str) -> str:
+    """Bỏ dấu tiếng Việt (gồm cả đ/Đ) để khớp từ khóa không dấu trong config."""
+    text = text.replace("đ", "d").replace("Đ", "D")
+    decomposed = unicodedata.normalize("NFD", text)
+    return "".join(ch for ch in decomposed if unicodedata.category(ch) != "Mn")
+
 
 def topic_filter(user_input: str) -> InputStatus:
     """Decide whether the input is on-topic for VinBank.
@@ -190,13 +196,21 @@ def topic_filter(user_input: str) -> InputStatus:
     input_lower = _normalize_text(user_input).lower()
     if not input_lower:
         return "BLOCK"
+    input_ascii = _strip_accents(input_lower)
+
+    def _matches_any(topics) -> bool:
+        for topic in topics:
+            t = topic.lower()
+            if t in input_lower or _strip_accents(t) in input_ascii:
+                return True
+        return False
 
     # 1. Chặn nếu chứa bất kỳ chủ đề cấm nào
-    if any(topic.lower() in input_lower for topic in BLOCKED_TOPICS):
+    if _matches_any(BLOCKED_TOPICS):
         return "BLOCK"
 
     # 2. Chặn nếu không chứa chủ đề ngân hàng nào được phép
-    if not any(topic.lower() in input_lower for topic in ALLOWED_TOPICS):
+    if not _matches_any(ALLOWED_TOPICS):
         return "BLOCK"
 
     return "ALLOW"

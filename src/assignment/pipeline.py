@@ -24,6 +24,7 @@ _APPROVED_DOMAINS = (
     "vinbank.vn",
     "vinbank.com",
     "vinbank.com.vn",
+    "vinbank.example",
 )
 
 _SENSITIVE_KV_RE = re.compile(
