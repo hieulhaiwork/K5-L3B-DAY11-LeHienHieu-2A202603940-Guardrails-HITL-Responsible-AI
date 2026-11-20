@@ -4,8 +4,11 @@ Checkpoint 2 — Output Guardrails
   - OutputGuardrailPlugin (ADK)           ← bắt buộc
   - LLM-as-Judge                          ← optional (không chấm)
 """
+import base64
+import codecs
 import re
 import textwrap
+import unicodedata
 
 from google.genai import types
 from google.adk.agents import llm_agent
@@ -13,6 +16,7 @@ from google.adk import runners
 from google.adk.plugins import base_plugin
 
 from core.utils import chat_with_agent
+from core.config import DEMO_SECRETS
 
 
 # ============================================================
@@ -26,6 +30,78 @@ from core.utils import chat_with_agent
 # - "issues": list of problems found
 # - "redacted": cleaned response (PII replaced with [REDACTED])
 # ============================================================
+def _out_skeleton(text: str) -> str:
+    norm = unicodedata.normalize("NFKC", text)
+    norm = "".join(ch for ch in norm if unicodedata.category(ch) != "Cf")
+    return re.sub(r"[^a-z0-9]", "", norm.lower())
+
+def _has_obfuscated_secret(text: str) -> list[str]:
+    """Phát hiện secret bị che giấu (chèn ký tự, đảo ngược, ROT13, Base64, Hex, acrostic)."""
+    found = []
+    # Các chữ ký đặc trưng của 3 secret demo (không trùng từ vựng banking bình thường)
+    raw_secrets = (
+        [str(v) for v in DEMO_SECRETS.values() if v]
+        if isinstance(DEMO_SECRETS, dict)
+        else [str(v) for v in DEMO_SECRETS if v]
+    )
+    signatures = set(raw_secrets)
+    signatures.update(["vinbank-secret", "db.vinbank.internal", "vinbank.internal:5432"])
+    sig_skeletons = {_out_skeleton(s) for s in signatures if len(_out_skeleton(s)) >= 6}
+
+    # Chuẩn bị các biến thể của toàn bộ output
+    skel = _out_skeleton(text)
+    rev_skel = skel[::-1]
+    rot13_skel = _out_skeleton(codecs.decode(text, "rot_13"))
+
+    # Acrostic: ghép chữ cái/số đầu tiên của từng dòng và từng từ
+    line_acrostic = _out_skeleton(
+        "".join(line.strip()[0] for line in text.splitlines() if line.strip())
+    )
+    word_acrostic = _out_skeleton(
+        "".join(w[0] for w in re.findall(r"[A-Za-z0-9]+", text))
+    )
+
+    views = {
+        "skeleton_obfuscated": skel,
+        "reversed_secret": rev_skel,
+        "rot13_secret": rot13_skel,
+        "line_acrostic_secret": line_acrostic,
+        "word_acrostic_secret": word_acrostic,
+    }
+    for label, view in views.items():
+        if any(sig in view for sig in sig_skeletons):
+            found.append(label)
+
+    # Kiểm tra Base64 / Hex mã hóa trực tiếp của secret
+    text_lower = text.lower()
+    for s in signatures:
+        b64 = base64.b64encode(s.encode()).decode().rstrip("=")
+        hx = s.encode().hex()
+        if (len(b64) >= 8 and b64 in text) or (len(hx) >= 12 and hx in text_lower):
+            found.append("encoded_secret_direct")
+            break
+
+    # Giải mã các chuỗi Base64 / Hex xuất hiện trong output rồi quét lại
+    for token in re.findall(r"\b[A-Za-z0-9+/]{12,}={0,2}\b", text):
+        try:
+            dec = base64.b64decode(token, validate=True).decode("utf-8", errors="ignore")
+            if any(sig in _out_skeleton(dec) for sig in sig_skeletons):
+                found.append("base64_decoded_secret")
+                break
+        except Exception:
+            continue
+
+    for token in re.findall(r"\b[0-9a-fA-F]{16,}\b", text):
+        if len(token) % 2 == 0:
+            try:
+                dec = bytes.fromhex(token).decode("utf-8", errors="ignore")
+                if any(sig in _out_skeleton(dec) for sig in sig_skeletons):
+                    found.append("hex_decoded_secret")
+                    break
+            except Exception:
+                continue
+
+    return list(dict.fromkeys(found))
 
 def content_filter(response: str) -> dict:
     """Filter response for PII, secrets, and harmful content.
@@ -41,12 +117,12 @@ def content_filter(response: str) -> dict:
 
     # PII patterns to check
     PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
+        "api_key": r"\bsk-[a-zA-Z0-9_-]+\b",
+        "db_host": r"\b[a-zA-Z0-9.-]+\.internal(?::\d+)?\b",
+        "password": r"(?:password|mật\s*khẩu)\s*(?:[:=]|is|là)\s*[^\s,;.]+",
+        "email": r"\b[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}\b",
+        "vn_phone": r"(?:\+84|0)\d{9,10}\b",
+        "national_id": r"\b\d{9}\b|\b\d{12}\b",
     }
 
     for name, pattern in PII_PATTERNS.items():
@@ -54,6 +130,23 @@ def content_filter(response: str) -> dict:
         if matches:
             issues.append(f"{name}: {len(matches)} found")
             redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+
+    secret_items = (
+        DEMO_SECRETS.items()
+        if isinstance(DEMO_SECRETS, dict)
+        else ((f"secret_{i}", v) for i, v in enumerate(DEMO_SECRETS))
+    )
+    for secret_name, secret_val in secret_items:
+        if secret_val and re.search(re.escape(str(secret_val)), redacted, re.IGNORECASE):
+            issues.append(f"secret_{secret_name}: leaked")
+            redacted = re.sub(
+                re.escape(str(secret_val)), "[REDACTED]", redacted, flags=re.IGNORECASE
+            )
+
+    obf_issues = _has_obfuscated_secret(redacted)
+    if obf_issues:
+        issues.extend(obf_issues)
+        redacted = "[REDACTED] Response blocked due to potential sensitive data exposure."
 
     return {
         "safe": len(issues) == 0,
@@ -172,16 +265,30 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        # 1. Lọc PII & secrets bằng content_filter
+        filter_result = content_filter(response_text)
+        if not filter_result["safe"]:
+            self.redacted_count += 1
+            response_text = filter_result["redacted"]
+            llm_response.content = types.Content(
+                role="model",
+                parts=[types.Part.from_text(text=response_text)],
+            )
 
-        return llm_response  # TODO: modify if needed
+        if self.use_llm_judge:
+            judge_result = await llm_safety_check(response_text)
+            if not judge_result["safe"]:
+                self.blocked_count += 1
+                llm_response.content = types.Content(
+                    role="model",
+                    parts=[
+                        types.Part.from_text(
+                            text="Response blocked by VinBank safety policy."
+                        )
+                    ],
+                )
+        
+        return llm_response
 
 
 # ============================================================
