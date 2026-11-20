@@ -51,6 +51,51 @@ _HOMOGLYPH_MAP = str.maketrans({
     "Н": "H", "К": "K", "В": "B", "ѕ": "s", "ј": "j", "ԁ": "d", "ɡ": "g",
 })
 
+_HARD_SKELETON_TRIGGERS = (
+    "ignorepreviousinstructions",
+    "ignoreallinstructions",
+    "ignoreaboveinstructions",
+    "systemprompt",
+    "adminpassword",
+    "vinbanksecrets",
+    "developermode",
+)
+
+_INJECTION_PATTERNS = [
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        # 1. Core override & role hijack (phủ đủ 6 case bắt buộc + jailbreak/mode)
+        r"\b(?:ignore|disregard|forget|override|bypass)\s+(?:all\s+)?(?:(?:previous|above|prior|earlier|system|your)\s+)?(?:instructions?|directives?|rules?|prompts?)\b",
+        r"\b(?:you\s+are\s+now|pretend\s+(?:you\s+are|to\s+be)|act\s+as\s+(?:a\s+|an\s+)?(?:unrestricted|unfiltered|jailbroken|admin|sysadmin|developer|root|auditor))\b",
+        r"\b(?:system\s+prompt|(?:developer|debug|maintenance|audit|god|dan)\s+mode|jailbreak)\b",
+        r"\b(?:instead\s+of|stop\s+being|forget\s+about)\s+(?:a\s+)?(?:banking|vinbank|bank\s+assistant)\b",
+
+        # 2. Prompt extraction, reformatting & encoding (cho phép 0-4 từ đệm, tránh FP)
+        r"\b(?:reveal|dump|leak|expose)\s+(?:me\s+)?(?:the\s+|your\s+)?(?:\w+\s+){0,2}(?:instructions?|prompt|secrets?|credentials?|rules?)\b",
+        r"\b(?:translate|convert|encode|format|summarize|paraphrase|rewrite)\s+(?:everything\s+above|the\s+above|(?:your|the)\s+(?:\w+\s+){0,4}(?:instructions?|prompt|system\s+message|config(?:uration)?|internal\s+\w+))\b",
+        r"\b(?:base64|rot13|hexadecimal|morse\s+code|caesar\s+cipher|ascii\s+codes?|leetspeak|acrostic)\b",
+
+        # 3. Internal secrets & side-channel probing (không chặn 'password' ngân hàng thông thường)
+        r"\b(?:admin(?:istrator)?[_\s-]?password|api[_\s-]?key|(?:db|database)[_\s-]?host|connection\s+string|internal\s+(?:database|config(?:uration)?|credentials?|system\s+context)|vinbank[_\s-]?secrets|port\s*5432)\b",
+        r"\b(?:confirm|verify|validate|check)\s+(?:if|whether|that)\s+(?:the\s+)?(?:admin|internal|secret|api|db|database|stored\s+config)\b",
+        r"\b(?:starts?\s+with|ends?\s+with|first\s+\d+\s+(?:chars?|characters?|letters?)|how\s+many\s+characters)\b[^.!?\n]{0,60}\b(?:admin|api|secret|host|prompt|credential)\b",
+        r"\b(?:fill\s+in\s+the\s+blank|complete\s+(?:this|the)\s+(?:config(?:uration)?|json|env|yaml|template|snippet))\b",
+        r"\b(?:hypothetical|fictional\s+story|movie\s+script|play\s+a\s+game|for\s+a\s+novel)\b[^.!?\n]{0,80}\b(?:admin|api\s*key|secret|database|prompt|internal|credential)\b",
+
+        # 4. Fake system delimiters
+        r"(?:<\|im_start\|>|<\|system\|>|\[system\]|###\s*system|new\s+system\s+instructions?)",
+
+        # 5. Tiếng Việt không dấu (khớp cả có dấu lẫn không dấu nhờ _strip_accents)
+        r"\b(?:bo\s+qua|quen\s+het|phot\s+lo|ghi\s+de)\s+(?:moi|tat\s+ca|cac)?\s*(?:huong\s+dan|chi\s+thi|quy\s+tac|lenh)\b",
+        r"\b(?:tiet\s+lo|cho\s+xem|in\s+ra|dich|ma\s+hoa)\b[^.!?\n]{0,60}\b(?:mat\s+khau\s+(?:admin|quan\s+tri)|system\s+prompt|api\s*key|khoa\s+api|db\s*host|bi\s+mat|cau\s+hinh\s+noi\s+bo|huong\s+dan\s+he\s+thong)\b",
+        r"\b(?:dong\s+vai|gia\s+vo\s+la)\b[^.!?\n]{0,40}\b(?:khong\s+gioi\s+han|quan\s+tri\s+vien|admin|kiem\s+toan\s+vien)\b",
+    )
+]
+
+# ============================================================
+# Text normalization helpers
+# ============================================================
+
 def _normalize_text(text: str) -> str:
     """Chuẩn hóa Unicode NFKC, xóa ký tự ẩn (category Cf) và gom khoảng trắng."""
     if not text:
@@ -61,6 +106,12 @@ def _normalize_text(text: str) -> str:
         if unicodedata.category(ch) != "Cf"
         )
     return re.sub(r"\s+", " ", cleaned).strip()
+
+def _strip_accents(text: str) -> str:
+    """Bỏ dấu tiếng Việt (gồm cả đ/Đ) để khớp từ khóa không dấu trong config."""
+    text = text.replace("đ", "d").replace("Đ", "D")
+    decomposed = unicodedata.normalize("NFD", text)
+    return "".join(ch for ch in decomposed if unicodedata.category(ch) != "Mn")
 
 def _skeleton(text: str) -> str:
     """Chỉ giữ chữ và số viết thường để bắt chiêu chèn dấu/khoảng trắng (p.a.s.s.w.o.r.d)."""
@@ -79,6 +130,10 @@ def _extract_decoded_base64(text: str) -> list[str]:
             continue
     return decoded_chunks
 
+# ============================================================
+# Detect prompt injection
+# ============================================================
+
 def detect_injection(user_input: str) -> InputStatus:
     """Detect prompt injection patterns in user input.
 
@@ -92,8 +147,17 @@ def detect_injection(user_input: str) -> InputStatus:
     if not normalized:
         return "ALLOW"
 
-    # Kiểm tra cả bản gốc đã chuẩn hóa lẫn các chuỗi Base64 giải mã được từ input
-    candidates = [normalized] + _extract_decoded_base64(normalized)
+    # Kiểm tra bản gốc, bản bỏ dấu tiếng Việt, và các đoạn Base64 giải mã được
+    candidates = [normalized]
+    ascii_norm = _strip_accents(normalized)
+    if ascii_norm != normalized:
+        candidates.append(ascii_norm)
+
+    for decoded in _extract_decoded_base64(normalized):
+        candidates.append(decoded)
+        decoded_ascii = _strip_accents(decoded)
+        if decoded_ascii != decoded:
+            candidates.append(decoded_ascii)
 
     # 1. Chặn Confirmation Attack: input nhắc trực tiếp tới giá trị secret (giống L2 Red Advance)
     raw_secrets = (
@@ -109,60 +173,14 @@ def detect_injection(user_input: str) -> InputStatus:
         skel = _skeleton(cand)
         if any(sec in skel for sec in secret_skeletons):
             return "BLOCK"
-
-        # Bắt lách khoảng trắng/ký tự cho các cụm cấm cốt lõi
-        hard_skeleton_triggers = [
-            "ignorepreviousinstructions",
-            "ignoreallinstructions",
-            "ignoreaboveinstructions",
-            "systemprompt",
-            "adminpassword",
-            "vinbanksecrets",
-            "developermode",
-        ]
-
-        if any(trig in skel for trig in hard_skeleton_triggers):
+        if any(trig in skel for trig in _HARD_SKELETON_TRIGGERS):
             return "BLOCK"
 
-        
-    INJECTION_PATTERNS = [
-        r"\bignore\s+(all\s+)?((previous|above|prior)\s+)?instructions?\b",
-        r"\byou\s+are\s+now\b",
-        r"\bsystem\s+prompt\b",
-        r"\breveal\s+(your\s+)?(instructions?|prompt|secrets?|rules?)\b",
-        r"\bpretend\s+(you\s+are|to\s+be)\b",
-        r"\bact\s+as\s+(a\s+|an\s+)?unrestricted\b",
-
-        # --- Nhóm trích xuất prompt / dịch / đổi định dạng (CP4 kỹ thuật #2) ---
-        r"\b(translate|convert|encode|format|summarize|paraphrase|rewrite)\s+(everything\s+above|the\s+above|your\s+(instructions?|prompt|rules?|system\s+message|config))\b",
-        r"\b(base64|rot13|hexadecimal|\bhex\b|morse\s+code|caesar\s+cipher|ascii\s+codes?|leetspeak|backwards|in\s+reverse|acrostic|first\s+letter\s+of\s+each)\b",
-        r"\b(verbatim|word\s+for\s+word|character\s+by\s+character|letter\s+by\s+letter|spell\s+out)\b",
-        r"\b(instead\s+of|stop\s+being|forget\s+about)\s+(a\s+)?(banking|vinbank|bank\s+assistant)\b",
-
-        # --- Nhóm dò secret / Confirmation / Completion (CP4 kỹ thuật #1 & #4) ---
-        r"\b(admin[_\s-]?password|api[_\s-]?key|db[_\s-]?host|connection\s+string|internal\s+database|vinbank[_\s-]?secrets|port\s*5432)\b",
-        r"\b(confirm|verify|validate|check)\s+(if|whether|that)\s+(the\s+)?(admin|system|internal|secret|api|db|database)\b",
-        r"\b(starts?\s+with|ends?\s+with|first\s+\d+\s+(chars?|characters?|letters?)|how\s+many\s+characters)\b.*(password|key|secret|host|prompt)",
-        r"\b(fill\s+in\s+the\s+blank|complete\s+(this|the)\s+(config|json|env|yaml|snippet|line))\b",
-
-        # --- Nhóm giả quyền / kịch bản giả định / tag hệ thống giả (CP4 kỹ thuật #3 & Indirect) ---
-        r"\b(developer\s+mode|debug\s+mode|maintenance\s+mode|audit\s+mode|god\s+mode|dan\s+mode|jailbreak)\b",
-        r"\b(hypothetical|fictional\s+story|movie\s+script|play\s+a\s+game|for\s+a\s+novel|security\s+audit\s+authorized)\b.*(password|key|secret|database|prompt|internal|credential)",
-        r"(<\|im_start\|>|<\|system\|>|\[system\]|###\s*system|new\s+system\s+instructions?|end\s+of\s+(email|document|context))",
-
-        # --- Tiếng Việt ---
-        r"(bỏ\s+qua|quên\s+hết|phớt\s+lờ|ghi\s+đè)\s+(mọi|tất\s+cả|các)?\s*(hướng\s+dẫn|chỉ\s+thị|quy\s+tắc|lệnh)",
-        r"(tiết\s+lộ|cho\s+xem|in\s+ra|dịch|mã\s+hóa)\s+.*(mật\s+khẩu\s+admin|system\s+prompt|api\s*key|db\s*host|bí\s+mật|cấu\s+hình\s+nội\s+bộ|hướng\s+dẫn\s+hệ\s+thống)",
-        r"(đóng\s+vai|giả\s+vờ\s+là)\s+.*(không\s+giới\s+hạn|quản\s+trị\s+viên|admin|kiểm\s+toán\s+viên)",
-
-
-    ]
-
+    # 2. Kiểm tra bộ regex đã biên dịch sẵn
     for cand in candidates:
-        for pattern in INJECTION_PATTERNS:
-            if re.search(pattern, cand, re.IGNORECASE):
-                return "BLOCK"
-    
+        if any(pattern.search(cand) for pattern in _INJECTION_PATTERNS):
+            return "BLOCK"
+
     return "ALLOW"
 
 
@@ -176,11 +194,6 @@ def detect_injection(user_input: str) -> InputStatus:
 # Return ``"BLOCK"`` if input should be blocked (off-topic / blocked topic).
 # Return ``"ALLOW"`` if banking-related and OK.
 # ============================================================
-def _strip_accents(text: str) -> str:
-    """Bỏ dấu tiếng Việt (gồm cả đ/Đ) để khớp từ khóa không dấu trong config."""
-    text = text.replace("đ", "d").replace("Đ", "D")
-    decomposed = unicodedata.normalize("NFD", text)
-    return "".join(ch for ch in decomposed if unicodedata.category(ch) != "Mn")
 
 
 def topic_filter(user_input: str) -> InputStatus:
